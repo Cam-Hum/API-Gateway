@@ -1,59 +1,86 @@
 require('dotenv').config();
-import http from "http";
-import { jwtVerify, createRemoteJWKSet } from "jose";
+const jose = require('jose');
+const express = require('express');
+const axios = require('axios');
+const app = express();
+app.use(express.json());
 
 const REGION = process.env.AWS_REGION;
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID;
 const CLIENT_ID = process.env.COGNITO_CLIENT_ID;
 const ISSUER = `https://cognito-idp.${REGION}.amazonaws.com/${USER_POOL_ID}`;
-const JWKS = createRemoteJWKSet(
+const JWKS = jose.createRemoteJWKSet(
   new URL(`${ISSUER}/.well-known/jwks.json`)
 );
 
-async function verifyJWT(req) {
-    const auth = req.headers.authorization;
-    if (!auth) {
-        throw new Error("No authorization header");
+async function authMiddleware(req, res, next) {
+  if (process.env.DEV_AUTH_BYPASS === 'true') {
+    const devUser = req.headers['x-dev-user'];
+    if (devUser) {
+      req.user = { sub: String(devUser) };
+      return next();
     }
-    const token = auth.split(" ")[1];
-    const { payload } = await jwtVerify(token, JWKS, {
-        issuer: ISSUER,
-        audience: CLIENT_ID,
+  }
+
+  const authHeader = req.headers['authorization'] || req.headers['Authorization'];
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing or invalid Authorization header' });
+  }
+
+  const token = authHeader.split(' ')[1];
+  try {
+    const { payload } = await jose.jwtVerify(token, JWKS, {
+      issuer: ISSUER,
+      audience: CLIENT_ID,
     });
-    return payload;
+    req.user = payload;
+    return next();
+  } catch (err) {
+    console.error('JWT verification failed:', err && err.message ? err.message : err);
+    return res.status(401).json({ error: 'Invalid token' });
+  }
 }
 
-function forward(req, res, host, port) {
-    const options = {
-        hostname: host,
-        port,
-        path: req.url,
-        method: req.method,
-        headers: req.headers,
+
+
+app.get('/ping', (req, res) => {
+    res.status(200).send('pong');
+});
+
+app.use('/booking', authMiddleware, async (req, res) => {
+  try {
+    const forwardPath = req.originalUrl.replace(/^\/booking/, '') || '/';
+    const url = 'http://bookingservice:8082' + forwardPath;
+
+    const headers = { ...req.headers };
+    delete headers.host;
+    if (req.user && req.user.sub) headers['x-user-id'] = req.user.sub;
+
+    const axiosConfig = {
+      method: req.method,
+      url,
+      headers,
+      params: req.query,
+      data: req.body,
+      validateStatus: () => true,
+      responseType: 'arraybuffer'
     };
 
-    const proxyReq = http.request(options, proxyRes => {
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
-        proxyRes.pipe(res);
+    const resp = await axios(axiosConfig);
+
+    const hopByHop = ['transfer-encoding', 'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailers', 'upgrade'];
+    Object.entries(resp.headers || {}).forEach(([k, v]) => {
+      if (!hopByHop.includes(k.toLowerCase())) res.setHeader(k, v);
     });
-    req.pipe(proxyReq);
-}
 
-const server = http.createServer(async (req, res) => {
-    if (req.url === "/ping") {
-        return res.statusCode = 200, res.end("pong");
-    }
-    try {
-        const user =await verifyJWT(req);
-
-        req.headers["x-user-id"] = user.sub;
-        req.headers["x-user-email"] = user.email || "";
-
-        forward(req, res, "localhost", 8082);
-    } catch (err) {
-        return res.statusCode = 401, res.end("Unauthorized");
-    }
+    res.status(resp.status).send(resp.data);
+  } catch (error) {
+    console.error('Error proxying to booking service:', error && error.message ? error.message : error);
+    res.status(502).json({ error: 'Bad gateway' });
+  }
 });
-server.listen(process.env.PORT, () => {
+
+
+app.listen(process.env.PORT, () => {
     console.log("API Gateway listening on port " + process.env.PORT);
 });
