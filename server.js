@@ -1,9 +1,14 @@
 require('dotenv').config();
 const jose = require('jose');
 const express = require('express');
+const cors = require('cors');
 const axios = require('axios');
 const app = express();
 app.use(express.json());
+
+// Enable CORS. Use CORS_ORIGIN env var or default to localhost:3000
+const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:3000';
+app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
 
 const REGION = process.env.AWS_REGION;
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID;
@@ -34,9 +39,12 @@ async function authMiddleware(req, res, next) {
       audience: CLIENT_ID,
     });
     req.user = payload;
+    console.log('JWT verified for user:', payload.sub);
     return next();
   } catch (err) {
-    console.error('JWT verification failed:', err && err.message ? err.message : err);
+    const msg = err && err.message ? err.message : String(err);
+    console.log('JWT verification failed:', msg);
+
     return res.status(401).json({ error: 'Invalid token' });
   }
 }
